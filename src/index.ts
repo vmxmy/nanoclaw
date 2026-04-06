@@ -30,6 +30,7 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  ackDeliveredMessages,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -38,8 +39,12 @@ import {
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
+  getPendingMessages,
   getRouterState,
   initDatabase,
+  markMessagesDelivered,
+  requeueMessagesForSession,
+  requeueStaleDeliveredMessages,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -97,6 +102,17 @@ function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
       );
     },
   );
+}
+
+/**
+ * Advance a timestamp by 1ms so the `>` comparison in getMessagesSince
+ * excludes the message we just processed. Without this, a message whose
+ * timestamp exactly equals the cursor is silently skipped.
+ */
+function advanceCursor(timestamp: string): string {
+  const d = new Date(timestamp);
+  d.setMilliseconds(d.getMilliseconds() + 1);
+  return d.toISOString();
 }
 
 function loadState(): void {
@@ -230,20 +246,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
-  const missedMessages = getMessagesSince(
-    chatJid,
-    getOrRecoverCursor(chatJid),
-    ASSISTANT_NAME,
-    MAX_MESSAGES_PER_PROMPT,
-  );
+  // Use durable delivery state to find unprocessed messages
+  const pendingMessages = getPendingMessages(chatJid, MAX_MESSAGES_PER_PROMPT);
 
-  if (missedMessages.length === 0) return true;
+  if (pendingMessages.length === 0) return true;
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const triggerPattern = getTriggerPattern(group.trigger);
     const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
+    const hasTrigger = pendingMessages.some(
       (m) =>
         triggerPattern.test(m.content.trim()) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
@@ -251,17 +263,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const prompt = formatMessages(pendingMessages, TIMEZONE);
+  const messageIds = pendingMessages.map((m) => m.id);
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  // Generate a session-scoped delivery ID for this batch
+  const deliverySessionId = `${group.folder}-${Date.now()}`;
+  markMessagesDelivered(chatJid, messageIds, deliverySessionId);
+
+  // Update the optimization-only cursor
+  lastAgentTimestamp[chatJid] = advanceCursor(
+    pendingMessages[pendingMessages.length - 1].timestamp,
+  );
   saveState();
 
+  queue.setActiveSession(chatJid, deliverySessionId);
+
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, messageCount: pendingMessages.length },
     'Processing messages',
   );
 
@@ -314,24 +332,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
+    // Requeue any in-flight messages that weren't acked
+    const inFlightIds = queue.flushInFlightMessageIds(chatJid);
+    const allIdsToRequeue = [...new Set([...messageIds, ...inFlightIds])];
+    requeueMessagesForSession(deliverySessionId, 'Agent error during processing');
+
     if (outputSentToUser) {
       logger.warn(
         { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        'Agent error after output was sent, messages requeued for safety but output was delivered',
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
     logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
+      { group: group.name, count: allIdsToRequeue.length },
+      'Agent error, requeued messages for retry',
     );
     return false;
   }
+
+  // Success — ack all messages in this batch
+  ackDeliveredMessages(chatJid, messageIds);
+  queue.markMessagesAcked(chatJid, messageIds);
 
   return true;
 }
@@ -371,12 +393,17 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
+  // Wrap onOutput to track session ID and handle message acks from container
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
+        }
+        // Ack messages that the container confirmed receiving via IPC drain
+        if (output.ackedMessageIds && output.ackedMessageIds.length > 0) {
+          ackDeliveredMessages(chatJid, output.ackedMessageIds);
+          queue.markMessagesAcked(chatJid, output.ackedMessageIds);
         }
         await onOutput(output);
       }
@@ -502,27 +529,33 @@ async function startMessageLoop(): Promise<void> {
             if (!hasTrigger) continue;
           }
 
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
+          // Pull all pending (delivery_status='pending') messages for context
+          const allPending = getPendingMessages(
             chatJid,
-            getOrRecoverCursor(chatJid),
-            ASSISTANT_NAME,
             MAX_MESSAGES_PER_PROMPT,
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
+          const messageIds = messagesToSend.map((m) => m.id);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // Try to deliver to an active, message-accepting container session
+          const sessionId = queue.getActiveSession(chatJid);
+          if (
+            sessionId &&
+            queue.sendMessage(chatJid, { messageIds, text: formatted })
+          ) {
+            // Mark messages as delivered to this session in DB
+            markMessagesDelivered(chatJid, messageIds, sessionId);
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { chatJid, count: messagesToSend.length, sessionId },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
+            // Update the optimization-only cursor
+            lastAgentTimestamp[chatJid] = advanceCursor(
+              messagesToSend[messagesToSend.length - 1].timestamp,
+            );
             saveState();
-            // Show typing indicator while the container processes the piped message
             channel
               .setTyping?.(chatJid, true)
               ?.catch((err) =>
@@ -542,17 +575,16 @@ async function startMessageLoop(): Promise<void> {
 }
 
 /**
- * Startup recovery: check for unprocessed messages in registered groups.
- * Handles crash between advancing lastTimestamp and processing messages.
+ * Startup recovery: check for pending or stale delivered messages in
+ * registered groups. Requeues any delivered-but-unacked messages left
+ * over from a previous crash, then enqueues groups that still have
+ * pending work.
  */
 function recoverPendingMessages(): void {
+  requeueStaleDeliveredMessages('Process restarted');
+
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const pending = getMessagesSince(
-      chatJid,
-      getOrRecoverCursor(chatJid),
-      ASSISTANT_NAME,
-      MAX_MESSAGES_PER_PROMPT,
-    );
+    const pending = getPendingMessages(chatJid, MAX_MESSAGES_PER_PROMPT);
     if (pending.length > 0) {
       logger.info(
         { group: group.name, pendingCount: pending.length },

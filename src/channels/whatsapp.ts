@@ -58,6 +58,8 @@ export interface WhatsAppChannelOpts {
 export class WhatsAppChannel implements Channel {
   name = 'whatsapp';
 
+  private static readonly CONNECT_READY_TIMEOUT_MS = 5000;
+
   private sock!: WASocket;
   private connected = false;
   private lidToPhoneMap: Record<string, string> = {};
@@ -84,8 +86,28 @@ export class WhatsAppChannel implements Channel {
 
   async connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      this.pendingFirstOpen = resolve;
-      this.connectInternal().catch(reject);
+      let settled = false;
+      const settle = (cb: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(readyTimeout);
+        cb();
+      };
+      const readyTimeout = setTimeout(() => {
+        logger.warn(
+          {
+            timeoutMs: WhatsAppChannel.CONNECT_READY_TIMEOUT_MS,
+          },
+          'WhatsApp startup still waiting for auth; continuing without blocking other channels',
+        );
+        settle(resolve);
+      }, WhatsAppChannel.CONNECT_READY_TIMEOUT_MS);
+
+      this.pendingFirstOpen = () => settle(resolve);
+      this.connectInternal().catch((err) => {
+        this.pendingFirstOpen = undefined;
+        settle(() => reject(err));
+      });
     });
   }
 
@@ -151,7 +173,8 @@ export class WhatsAppChannel implements Channel {
         exec(
           `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
         );
-        setTimeout(() => process.exit(1), 1000);
+        // Don't exit — let other channels (Telegram, etc.) keep running.
+        // Re-authenticate via /setup when ready.
       }
 
       if (connection === 'close') {
@@ -212,6 +235,10 @@ export class WhatsAppChannel implements Channel {
         this.syncGroupMetadata().catch((err) =>
           logger.error({ err }, 'Initial group sync failed'),
         );
+        // Pre-fill cachedGroupMetadata cache for registered groups
+        this.prefillGroupMetadataCache().catch((err) =>
+          logger.error({ err }, 'Failed to prefill group metadata cache'),
+        );
         // Set up daily sync timer (only once)
         if (!this.groupSyncTimerStarted) {
           this.groupSyncTimerStarted = true;
@@ -232,10 +259,34 @@ export class WhatsAppChannel implements Channel {
 
     this.sock.ev.on('creds.update', saveCreds);
 
-    this.sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
-      const lidUser = lid?.split('@')[0].split(':')[0];
-      if (lidUser && jid) {
-        this.setLidPhoneMapping(lidUser, jid);
+    // Keep cachedGroupMetadata cache fresh via event listeners
+    // (per Baileys README recommendation)
+    this.sock.ev.on('groups.update', async (events) => {
+      for (const event of events) {
+        if (!event.id) continue;
+        try {
+          const metadata = await this.sock.groupMetadata(event.id);
+          this.groupMetadataCache.set(event.id, {
+            metadata,
+            expiresAt: Date.now() + 5 * 60_000,
+          });
+          logger.debug({ jid: event.id }, 'Group metadata cache updated (groups.update)');
+        } catch (err) {
+          logger.debug({ jid: event.id, err }, 'Failed to update group metadata on groups.update');
+        }
+      }
+    });
+
+    this.sock.ev.on('group-participants.update', async (event) => {
+      try {
+        const metadata = await this.sock.groupMetadata(event.id);
+        this.groupMetadataCache.set(event.id, {
+          metadata,
+          expiresAt: Date.now() + 5 * 60_000,
+        });
+        logger.debug({ jid: event.id }, 'Group metadata cache updated (group-participants.update)');
+      } catch (err) {
+        logger.debug({ jid: event.id, err }, 'Failed to update group metadata on group-participants.update');
       }
     });
 
@@ -493,38 +544,41 @@ export class WhatsAppChannel implements Channel {
 
   private async getNormalizedGroupMetadata(
     jid: string,
-    forceRefresh = false,
   ): Promise<GroupMetadata | undefined> {
     if (!jid.endsWith('@g.us')) return undefined;
 
+    // Only return from cache — never make network calls here.
+    // This callback is invoked by Baileys during sendMessage(); making
+    // sock.groupMetadata() calls here deadlocks the socket.
     const cached = this.groupMetadataCache.get(jid);
-    if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
+    if (cached && cached.expiresAt > Date.now()) {
       return cached.metadata;
     }
+    return undefined;
+  }
 
-    const metadata = await this.sock.groupMetadata(jid);
-    const participants = await Promise.all(
-      metadata.participants.map(async (participant) => ({
-        ...participant,
-        id: await this.translateJid(participant.id),
-      })),
-    );
-    const normalized = { ...metadata, participants };
-    const mappedCount = participants.filter(
-      (participant, index) =>
-        participant.id !== metadata.participants[index]?.id,
-    ).length;
-
-    logger.info(
-      { jid, participantCount: participants.length, mappedCount },
-      'Prepared normalized group metadata for send',
-    );
-
-    this.groupMetadataCache.set(jid, {
-      metadata: normalized,
-      expiresAt: Date.now() + 60_000,
-    });
-    return normalized;
+  /**
+   * Pre-fill the group metadata cache for all registered groups on connect.
+   * This ensures cachedGroupMetadata returns data immediately during sendMessage().
+   */
+  private async prefillGroupMetadataCache(): Promise<void> {
+    const groups = this.opts.registeredGroups();
+    for (const jid of Object.keys(groups)) {
+      if (!jid.endsWith('@g.us')) continue;
+      try {
+        const metadata = await this.sock.groupMetadata(jid);
+        this.groupMetadataCache.set(jid, {
+          metadata,
+          expiresAt: Date.now() + 5 * 60_000,
+        });
+        logger.info(
+          { jid, participantCount: metadata.participants.length },
+          'Prefilled group metadata cache',
+        );
+      } catch (err) {
+        logger.warn({ jid, err }, 'Failed to prefill group metadata cache');
+      }
+    }
   }
 
   private async flushOutgoingQueue(): Promise<void> {

@@ -2,14 +2,21 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  ackDeliveredMessages,
   createTask,
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getDeliveredMessagesForSession,
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
+  getPendingMessages,
   getTaskById,
+  markMessagesDelivered,
+  markMessagesFailed,
+  requeueMessagesForSession,
+  requeueStaleDeliveredMessages,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
@@ -648,5 +655,145 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- Message delivery state machine ---
+
+describe('message delivery state', () => {
+  beforeEach(() => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+
+    store({
+      id: 'd1',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'message 1',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    store({
+      id: 'd2',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'message 2',
+      timestamp: '2024-01-01T00:00:02.000Z',
+    });
+    store({
+      id: 'd3',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'message 3',
+      timestamp: '2024-01-01T00:00:03.000Z',
+    });
+  });
+
+  it('new messages start as pending', () => {
+    const pending = getPendingMessages('group@g.us');
+    expect(pending).toHaveLength(3);
+    expect(pending[0].id).toBe('d1');
+    expect(pending[0].delivery_status).toBe('pending');
+  });
+
+  it('bot messages start as acked', () => {
+    storeMessage({
+      id: 'bot-1',
+      chat_jid: 'group@g.us',
+      sender: 'bot@s.whatsapp.net',
+      sender_name: 'Bot',
+      content: 'bot reply',
+      timestamp: '2024-01-01T00:00:04.000Z',
+      is_bot_message: true,
+    });
+    const pending = getPendingMessages('group@g.us');
+    // bot message should not appear in pending
+    expect(pending).toHaveLength(3);
+    expect(pending.every((m) => m.id !== 'bot-1')).toBe(true);
+  });
+
+  it('transitions pending -> delivered with session ID', () => {
+    markMessagesDelivered('group@g.us', ['d1', 'd2'], 'sess-1');
+
+    const pending = getPendingMessages('group@g.us');
+    expect(pending).toHaveLength(1);
+    expect(pending[0].id).toBe('d3');
+
+    const delivered = getDeliveredMessagesForSession('sess-1');
+    expect(delivered).toHaveLength(2);
+    expect(delivered[0].delivery_status).toBe('delivered');
+    expect(delivered[0].assigned_session_id).toBe('sess-1');
+  });
+
+  it('transitions delivered -> acked', () => {
+    markMessagesDelivered('group@g.us', ['d1'], 'sess-1');
+    ackDeliveredMessages('group@g.us', ['d1']);
+
+    const pending = getPendingMessages('group@g.us');
+    expect(pending).toHaveLength(2);
+    expect(pending.every((m) => m.id !== 'd1')).toBe(true);
+  });
+
+  it('requeues delivered messages when session dies', () => {
+    markMessagesDelivered('group@g.us', ['d1', 'd2'], 'sess-1');
+    requeueMessagesForSession('sess-1', 'container crashed');
+
+    const pending = getPendingMessages('group@g.us');
+    expect(pending).toHaveLength(3);
+    // d1 and d2 were requeued
+    const pendingIds = pending.map((m) => m.id);
+    expect(pendingIds).toContain('d1');
+    expect(pendingIds).toContain('d2');
+  });
+
+  it('requeues all stale delivered messages regardless of session identity', () => {
+    markMessagesDelivered('group@g.us', ['d1'], 'delivery-session-1');
+    markMessagesDelivered('group@g.us', ['d2'], 'delivery-session-2');
+    ackDeliveredMessages('group@g.us', ['d2']);
+
+    requeueStaleDeliveredMessages('process restarted');
+
+    const pending = getPendingMessages('group@g.us');
+    const pendingIds = pending.map((m) => m.id);
+    expect(pendingIds).toContain('d1');
+    expect(pendingIds).not.toContain('d2');
+  });
+
+  it('handles the full lifecycle: pending -> delivered -> acked', () => {
+    // Step 1: fetch pending
+    let pending = getPendingMessages('group@g.us');
+    expect(pending).toHaveLength(3);
+    const ids = pending.map((m) => m.id);
+
+    // Step 2: mark delivered
+    markMessagesDelivered('group@g.us', ids, 'sess-full');
+    expect(getPendingMessages('group@g.us')).toHaveLength(0);
+
+    // Step 3: ack after processing
+    ackDeliveredMessages('group@g.us', ids);
+    expect(getPendingMessages('group@g.us')).toHaveLength(0);
+    expect(getDeliveredMessagesForSession('sess-full')).toHaveLength(0);
+  });
+
+  it('recovers from crash at delivered state via requeue', () => {
+    markMessagesDelivered('group@g.us', ['d1', 'd2'], 'sess-crash');
+
+    // Simulate crash: requeue the session's messages
+    requeueMessagesForSession('sess-crash', 'container timeout');
+
+    // Messages are back to pending
+    const pending = getPendingMessages('group@g.us');
+    expect(pending).toHaveLength(3);
+  });
+
+  it('getPendingMessages respects limit', () => {
+    const pending = getPendingMessages('group@g.us', 2);
+    expect(pending).toHaveLength(2);
+  });
+
+  it('getPendingMessages returns empty for unregistered chat', () => {
+    const pending = getPendingMessages('unknown@g.us');
+    expect(pending).toHaveLength(0);
   });
 });

@@ -257,7 +257,7 @@ describe('WhatsAppChannel', () => {
   // --- QR code and auth ---
 
   describe('authentication', () => {
-    it('exits process when QR code is emitted (no auth state)', async () => {
+    it('does not exit the process when QR code is emitted', async () => {
       vi.useFakeTimers();
       const mockExit = vi
         .spyOn(process, 'exit')
@@ -266,20 +266,31 @@ describe('WhatsAppChannel', () => {
       const opts = createTestOpts();
       const channel = new WhatsAppChannel(opts);
 
-      // Start connect but don't await (it won't resolve - process exits)
       channel.connect().catch(() => {});
-
-      // Flush microtasks so connectInternal registers handlers
       await vi.advanceTimersByTimeAsync(0);
 
-      // Emit QR code event
       fakeSocket._ev.emit('connection.update', { qr: 'some-qr-data' });
-
-      // Advance timer past the 1000ms setTimeout before exit
       await vi.advanceTimersByTimeAsync(1500);
 
-      expect(mockExit).toHaveBeenCalledWith(1);
+      expect(mockExit).not.toHaveBeenCalled();
       mockExit.mockRestore();
+      vi.useRealTimers();
+    });
+
+    it('resolves connect() after auth wait timeout so startup can continue', async () => {
+      vi.useFakeTimers();
+
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      const connectPromise = channel.connect();
+      await vi.advanceTimersByTimeAsync(0);
+
+      fakeSocket._ev.emit('connection.update', { qr: 'some-qr-data' });
+      await vi.advanceTimersByTimeAsync(5000);
+
+      await expect(connectPromise).resolves.toBeUndefined();
+      expect(channel.isConnected()).toBe(false);
       vi.useRealTimers();
     });
   });

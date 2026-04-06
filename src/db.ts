@@ -6,6 +6,8 @@ import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  DeliverableMessage,
+  MessageDeliveryStatus,
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
@@ -113,6 +115,53 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add durable delivery state columns if they don't exist.
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN delivery_status TEXT DEFAULT 'pending'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN delivery_attempts INTEGER DEFAULT 0`,
+    );
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN assigned_session_id TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN delivered_at TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN acked_at TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN last_delivery_error TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_delivery_status
+      ON messages(chat_jid, delivery_status, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_messages_assigned_session
+      ON messages(assigned_session_id, delivery_status);
+  `);
+  database.exec(`
+    UPDATE messages
+    SET delivery_status = CASE WHEN is_bot_message = 1 THEN 'acked' ELSE 'pending' END
+    WHERE delivery_status IS NULL OR delivery_status = ''
+  `);
+
   // Add is_main column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -170,7 +219,22 @@ export function initDatabase(): void {
   migrateJsonState();
 }
 
-/** @internal - for tests only. Creates a fresh in-memory database. */
+interface MessageStorageOptions {
+  deliverable?: boolean;
+}
+
+function getInitialDeliveryStatus(
+  msg: Pick<NewMessage, 'is_bot_message' | 'is_from_me'>,
+  options?: MessageStorageOptions,
+): MessageDeliveryStatus {
+  if (msg.is_bot_message) return 'acked';
+  return options?.deliverable === false ? 'acked' : 'pending';
+}
+
+function mapDeliverableRows(rows: unknown[]): DeliverableMessage[] {
+  return rows as DeliverableMessage[];
+}
+
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
   createSchema(db);
@@ -283,9 +347,19 @@ export function setLastGroupSync(): void {
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
  */
-export function storeMessage(msg: NewMessage): void {
+export function storeMessage(
+  msg: NewMessage,
+  options?: MessageStorageOptions,
+): void {
+  const deliveryStatus = getInitialDeliveryStatus(msg, options);
+  const ackedAt = deliveryStatus === 'acked' ? msg.timestamp : null;
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, reply_to_message_id, reply_to_message_content, reply_to_sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (
+      id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+      is_bot_message, delivery_status, delivery_attempts, assigned_session_id,
+      delivered_at, acked_at, last_delivery_error, reply_to_message_id,
+      reply_to_message_content, reply_to_sender_name
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -295,6 +369,12 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    deliveryStatus,
+    0,
+    null,
+    null,
+    ackedAt,
+    null,
     msg.reply_to_message_id ?? null,
     msg.reply_to_message_content ?? null,
     msg.reply_to_sender_name ?? null,
@@ -314,8 +394,14 @@ export function storeMessageDirect(msg: {
   is_from_me: boolean;
   is_bot_message?: boolean;
 }): void {
+  const deliveryStatus = getInitialDeliveryStatus(msg);
+  const ackedAt = deliveryStatus === 'acked' ? msg.timestamp : null;
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (
+      id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+      is_bot_message, delivery_status, delivery_attempts, assigned_session_id,
+      delivered_at, acked_at, last_delivery_error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -325,6 +411,12 @@ export function storeMessageDirect(msg: {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    deliveryStatus,
+    0,
+    null,
+    null,
+    ackedAt,
+    null,
   );
 }
 
@@ -389,6 +481,129 @@ export function getMessagesSince(
   return db
     .prepare(sql)
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+}
+
+
+export function getPendingMessages(
+  chatJid: string,
+  limit: number = 200,
+): DeliverableMessage[] {
+  const sql = `
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+           is_bot_message, reply_to_message_id, reply_to_message_content,
+           reply_to_sender_name, delivery_status, delivery_attempts,
+           assigned_session_id, delivered_at, acked_at, last_delivery_error
+    FROM messages
+    WHERE chat_jid = ?
+      AND delivery_status = 'pending'
+      AND is_bot_message = 0
+      AND content != '' AND content IS NOT NULL
+    ORDER BY timestamp
+    LIMIT ?
+  `;
+  return mapDeliverableRows(db.prepare(sql).all(chatJid, limit));
+}
+
+export function markMessagesDelivered(
+  chatJid: string,
+  messageIds: string[],
+  sessionId: string,
+  deliveredAt: string = new Date().toISOString(),
+): void {
+  if (messageIds.length === 0) return;
+  const placeholders = messageIds.map(() => '?').join(',');
+  db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'delivered',
+         delivery_attempts = delivery_attempts + 1,
+         assigned_session_id = ?,
+         delivered_at = ?,
+         acked_at = NULL,
+         last_delivery_error = NULL
+     WHERE chat_jid = ?
+       AND id IN (${placeholders})
+       AND delivery_status = 'pending'`,
+  ).run(sessionId, deliveredAt, chatJid, ...messageIds);
+}
+
+export function ackDeliveredMessages(
+  chatJid: string,
+  messageIds: string[],
+  ackedAt: string = new Date().toISOString(),
+): void {
+  if (messageIds.length === 0) return;
+  const placeholders = messageIds.map(() => '?').join(',');
+  db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'acked',
+         acked_at = ?,
+         last_delivery_error = NULL
+     WHERE chat_jid = ?
+       AND id IN (${placeholders})
+       AND delivery_status IN ('pending', 'delivered')`,
+  ).run(ackedAt, chatJid, ...messageIds);
+}
+
+export function getDeliveredMessagesForSession(
+  sessionId: string,
+): DeliverableMessage[] {
+  const sql = `
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+           is_bot_message, reply_to_message_id, reply_to_message_content,
+           reply_to_sender_name, delivery_status, delivery_attempts,
+           assigned_session_id, delivered_at, acked_at, last_delivery_error
+    FROM messages
+    WHERE assigned_session_id = ?
+      AND delivery_status = 'delivered'
+    ORDER BY timestamp
+  `;
+  return mapDeliverableRows(db.prepare(sql).all(sessionId));
+}
+
+export function requeueMessagesForSession(
+  sessionId: string,
+  error?: string,
+): void {
+  db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'pending',
+         assigned_session_id = NULL,
+         delivered_at = NULL,
+         acked_at = NULL,
+         last_delivery_error = ?
+     WHERE assigned_session_id = ?
+       AND delivery_status = 'delivered'`,
+  ).run(error ?? null, sessionId);
+}
+
+export function requeueStaleDeliveredMessages(error?: string): void {
+  db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'pending',
+         assigned_session_id = NULL,
+         delivered_at = NULL,
+         acked_at = NULL,
+         last_delivery_error = ?
+     WHERE delivery_status = 'delivered'`,
+  ).run(error ?? null);
+}
+
+
+export function markMessagesFailed(
+  chatJid: string,
+  messageIds: string[],
+  error: string,
+): void {
+  if (messageIds.length === 0) return;
+  const placeholders = messageIds.map(() => '?').join(',');
+  db.prepare(
+    `UPDATE messages
+     SET delivery_status = 'failed',
+         last_delivery_error = ?,
+         assigned_session_id = NULL
+     WHERE chat_jid = ?
+       AND id IN (${placeholders})`,
+  ).run(error, chatJid, ...messageIds);
 }
 
 export function getLastBotMessageTimestamp(
